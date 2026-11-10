@@ -1,0 +1,189 @@
+# Part 2 — GitOps delivery with Flux (fully in-cluster, no external Git).
+#
+# Prereq:  flux install
+# Apply:   kubectl apply -f flux-podinfo.yaml
+#
+# Layout:
+#   ns gitops-lab : a chart-server (nginx) that serves a Helm repo built from the
+#                   `podinfo-chart` ConfigMap by an init container (alpine/helm).
+#   ns podinfo    : a Flux HelmRepository -> that in-cluster server, and a HelmRelease
+#                   that installs the chart. The HelmRelease has one defect to find & fix.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitops-lab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podinfo
+---
+# The Helm chart, as plain readable files. An init container packages this into a
+# Helm repository (index.yaml + .tgz) that nginx then serves.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: podinfo-chart
+  namespace: gitops-lab
+data:
+  Chart.yaml: |
+    apiVersion: v2
+    name: podinfo
+    description: Minimal chart that deploys the podinfo backend
+    type: application
+    version: 0.1.0
+    appVersion: "6.6.0"
+  values.yaml: |
+    replicaCount: 2
+    image: stefanprodan/podinfo:6.6.0
+  deployment.yaml: |
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ .Release.Name }}
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      replicas: {{ .Values.replicaCount }}
+      selector:
+        matchLabels:
+          app: {{ .Release.Name }}
+      template:
+        metadata:
+          labels:
+            app: {{ .Release.Name }}
+        spec:
+          containers:
+            - name: podinfo
+              image: {{ .Values.image }}
+              ports:
+                - name: http
+                  containerPort: 9898
+              readinessProbe:
+                httpGet:
+                  path: /readyz
+                  port: http
+              resources:
+                limits:
+                  memory: 64Mi
+  service.yaml: |
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: {{ .Release.Name }}
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      selector:
+        app: {{ .Release.Name }}
+      ports:
+        - name: http
+          port: 9898
+          targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chart-server
+  namespace: gitops-lab
+  labels:
+    app: chart-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chart-server
+  template:
+    metadata:
+      labels:
+        app: chart-server
+    spec:
+      initContainers:
+        - name: package
+          image: alpine/helm:3.14.4
+          env:
+            - name: HOME
+              value: /tmp
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /tmp/chart/templates
+              cp /chart-src/Chart.yaml    /tmp/chart/Chart.yaml
+              cp /chart-src/values.yaml   /tmp/chart/values.yaml
+              cp /chart-src/deployment.yaml /tmp/chart/templates/deployment.yaml
+              cp /chart-src/service.yaml    /tmp/chart/templates/service.yaml
+              helm package /tmp/chart -d /srv
+              helm repo index /srv --url http://chart-server.gitops-lab.svc.cluster.local
+              ls -l /srv
+          volumeMounts:
+            - name: chart-src
+              mountPath: /chart-src
+            - name: web
+              mountPath: /srv
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: web
+              mountPath: /usr/share/nginx/html
+          resources:
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: chart-src
+          configMap:
+            name: podinfo-chart
+        - name: web
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chart-server
+  namespace: gitops-lab
+  labels:
+    app: chart-server
+spec:
+  selector:
+    app: chart-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Flux source: the in-cluster Helm repository served by chart-server.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: local-charts
+  namespace: podinfo
+spec:
+  interval: 1m
+  url: http://chart-server.gitops-lab.svc.cluster.local
+---
+# Flux release: installs the podinfo chart from the in-cluster repo.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: podinfo
+  namespace: podinfo
+spec:
+  interval: 1m
+  chart:
+    spec:
+      chart: podinfo
+      version: "0.1.0"
+      sourceRef:
+        kind: HelmRepository
+        # NOTE: this must reference the HelmRepository defined above by name.
+        name: local-chartz
+  driftDetection:
+    mode: enabled
+  values:
+    replicaCount: 2

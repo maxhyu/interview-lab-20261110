@@ -1,0 +1,147 @@
+# Part 1 — The model-runtime Service
+#
+# Apply with:  kubectl apply -f model-runtime-lab.yaml
+#
+# Everything is in the `model-runtime-lab` namespace and uses public Docker Hub images
+# (stefanprodan/podinfo, polinux/stress, curlimages/curl). No CNI or image loading needed.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: model-runtime-lab
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-runtime
+  namespace: model-runtime-lab
+  labels:
+    app.kubernetes.io/name: model-runtime
+spec:
+  type: ClusterIP
+  selector:
+    app: model
+  ports:
+    - name: http
+      port: 80
+      targetPort: 9898
+      protocol: TCP
+---
+# The production model runtime — podinfo, serving on its default port 9898.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-runtime
+  namespace: model-runtime-lab
+  labels:
+    app.kubernetes.io/name: model-runtime
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: model
+      role: runtime
+  template:
+    metadata:
+      labels:
+        app: model
+        role: runtime
+    spec:
+      containers:
+        - name: podinfo
+          image: stefanprodan/podinfo:6.6.0
+          command: ["./podinfo"]
+          args:
+            - --port=9898
+            - --ui-message=model-runtime v1
+          ports:
+            - name: http
+              containerPort: 9898
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          # --------------------------------------------------------------------
+          # Act 2 TODO: add a startupProbe here (HTTP GET /readyz on port http),
+          # and be ready to explain how it differs from liveness and readiness.
+          # --------------------------------------------------------------------
+          resources:
+            limits:
+              memory: 64Mi
+---
+# A new version a teammate rolled out. Also podinfo, but started on a different port.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-canary
+  namespace: model-runtime-lab
+  labels:
+    app.kubernetes.io/name: model-canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model
+      role: canary
+  template:
+    metadata:
+      labels:
+        app: model
+        role: canary
+    spec:
+      containers:
+        - name: podinfo
+          image: stefanprodan/podinfo:6.6.0
+          command: ["./podinfo"]
+          args:
+            - --port=8080
+            - --ui-message=model-canary v2
+            - --ui-color=#8B0000
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            limits:
+              memory: 64Mi
+---
+# A loader job that keeps failing to stay up.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-loader
+  namespace: model-runtime-lab
+  labels:
+    app.kubernetes.io/name: model-loader
+spec:
+  containers:
+    - name: loader
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--vm", "1", "--vm-bytes", "100M", "--vm-hang", "1"]
+      resources:
+        limits:
+          memory: 32Mi
+  restartPolicy: Always
+---
+# Debug box with curl.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: toolbox
+  namespace: model-runtime-lab
+  labels:
+    app.kubernetes.io/name: toolbox
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:latest
+      command: ["/bin/sh", "-c", "sleep infinity"]
+  restartPolicy: Always
